@@ -28,6 +28,45 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void forward_kernel(int N, int increment, int *result) {
+    int index = increment * (blockIdx.x * blockDim.x + threadIdx.x);
+
+    if (index < N)
+        result[index + increment - 1] += result[index + increment/2 - 1];
+}
+
+__global__ void backward_kernel(int N, int increment, int *result) {
+    int index = increment * (blockIdx.x * blockDim.x + threadIdx.x);
+
+    if (index < N) {
+        int elt = result[index + (increment / 2) - 1];
+        result[index + increment/2 - 1] = result[index + increment - 1];
+        result[index + increment -1] += elt;
+    }
+}
+
+void scan_forward(int increment, int N, int *result) {
+    int tasks = N / increment;
+    const int threadsPerBlock = 512;
+    const int blocks = (tasks + threadsPerBlock - 1) / threadsPerBlock;
+    printf("%d\n", __LINE__);
+    forward_kernel<<<blocks, threadsPerBlock>>>(N, increment, result);
+    printf("%d\n", __LINE__);
+    cudaThreadSynchronize();
+    printf("%d\n", __LINE__);
+}
+
+void scan_backward(int increment, int N, int *result) {
+    int tasks = N / increment;
+    const int threadsPerBlock = 512;
+    const int blocks = (tasks + threadsPerBlock - 1) / threadsPerBlock;
+    printf("%d\n", __LINE__);
+    forward_kernel<<<blocks, threadsPerBlock>>>(N, increment, result);
+    printf("%d\n", __LINE__);
+    cudaThreadSynchronize();
+    printf("%d\n", __LINE__);
+}
+
 void exclusive_scan(int* device_start, int length, int* device_result)
 {
     /* Fill in this function with your exclusive scan implementation.
@@ -39,6 +78,28 @@ void exclusive_scan(int* device_start, int length, int* device_result)
      * both the input and the output arrays are sized to accommodate the next
      * power of 2 larger than the input.
      */
+    int N = length;
+    printf("%d\n", __LINE__);
+    // upsweep phase.
+    for (int twod = 1; twod < N; twod*=2)
+    {
+        int twod1 = twod*2;
+        scan_forward(twod1, N, device_result);
+    }
+    printf("%d\n", __LINE__);
+    int zero = 0;
+    // device_result[N-1] = 0;
+    cudaMemcpy(device_result + N-1, &zero, sizeof(int), cudaMemcpyHostToDevice);
+    // downsweep phase.
+    printf("%d\n", __LINE__);
+
+    for (int twod = N/2; twod >= 1; twod /= 2)
+    {
+        int twod1 = twod*2;
+        printf("%d\n", __LINE__);
+        scan_backward(twod1, N, device_result);
+    }
+    printf("%d\n", __LINE__);
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -47,6 +108,7 @@ void exclusive_scan(int* device_start, int length, int* device_result)
  */
 double cudaScan(int* inarray, int* end, int* resultarray)
 {
+    printf("%d\n", __LINE__);
     int* device_result;
     int* device_input; 
     // We round the array sizes up to a power of 2, but elements after
@@ -60,7 +122,6 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     cudaMalloc((void **)&device_input, sizeof(int) * rounded_length);
     cudaMemcpy(device_input, inarray, (end - inarray) * sizeof(int), 
                cudaMemcpyHostToDevice);
-
     // For convenience, both the input and output vectors on the device are
     // initialized to the input values. This means that you are free to simply
     // implement an in-place scan on the result vector if you wish.
