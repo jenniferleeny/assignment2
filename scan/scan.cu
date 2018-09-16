@@ -37,8 +37,9 @@ __global__ void forward_kernel(int N, int increment, int *result) {
 
 __global__ void backward_kernel(int N, int increment, int *result) {
     int index = increment * (blockIdx.x * blockDim.x + threadIdx.x);
-
+    printf("last index %d %d %d\n", index, N, index+increment/2 - 1);
     if (index < N) {
+        printf("last index %d\n", index+increment/2 - 1);
         int elt = result[index + (increment / 2) - 1];
         result[index + increment/2 - 1] = result[index + increment - 1];
         result[index + increment -1] += elt;
@@ -61,7 +62,7 @@ void scan_backward(int increment, int N, int *result) {
     const int threadsPerBlock = 512;
     const int blocks = (tasks + threadsPerBlock - 1) / threadsPerBlock;
     printf("%d\n", __LINE__);
-    forward_kernel<<<blocks, threadsPerBlock>>>(N, increment, result);
+    backward_kernel<<<blocks, threadsPerBlock>>>(N, increment, result);
     printf("%d\n", __LINE__);
     cudaThreadSynchronize();
     printf("%d\n", __LINE__);
