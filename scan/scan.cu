@@ -37,9 +37,7 @@ __global__ void forward_kernel(int N, int increment, int *result) {
 
 __global__ void backward_kernel(int N, int increment, int *result) {
     int index = increment * (blockIdx.x * blockDim.x + threadIdx.x);
-    printf("last index %d %d %d\n", index, N, index+increment/2 - 1);
     if (index < N) {
-        printf("last index %d\n", index+increment/2 - 1);
         int elt = result[index + (increment / 2) - 1];
         result[index + increment/2 - 1] = result[index + increment - 1];
         result[index + increment -1] += elt;
@@ -50,22 +48,16 @@ void scan_forward(int increment, int N, int *result) {
     int tasks = N / increment;
     const int threadsPerBlock = 512;
     const int blocks = (tasks + threadsPerBlock - 1) / threadsPerBlock;
-    printf("%d\n", __LINE__);
     forward_kernel<<<blocks, threadsPerBlock>>>(N, increment, result);
-    printf("%d\n", __LINE__);
     cudaThreadSynchronize();
-    printf("%d\n", __LINE__);
 }
 
 void scan_backward(int increment, int N, int *result) {
     int tasks = N / increment;
     const int threadsPerBlock = 512;
     const int blocks = (tasks + threadsPerBlock - 1) / threadsPerBlock;
-    printf("%d\n", __LINE__);
     backward_kernel<<<blocks, threadsPerBlock>>>(N, increment, result);
-    printf("%d\n", __LINE__);
     cudaThreadSynchronize();
-    printf("%d\n", __LINE__);
 }
 
 void exclusive_scan(int* device_start, int length, int* device_result)
@@ -79,28 +71,23 @@ void exclusive_scan(int* device_start, int length, int* device_result)
      * both the input and the output arrays are sized to accommodate the next
      * power of 2 larger than the input.
      */
-    int N = length;
-    printf("%d\n", __LINE__);
+    int N = nextPow2(length);
     // upsweep phase.
     for (int twod = 1; twod < N; twod*=2)
     {
         int twod1 = twod*2;
         scan_forward(twod1, N, device_result);
     }
-    printf("%d\n", __LINE__);
     int zero = 0;
     // device_result[N-1] = 0;
     cudaMemcpy(device_result + N-1, &zero, sizeof(int), cudaMemcpyHostToDevice);
     // downsweep phase.
-    printf("%d\n", __LINE__);
 
     for (int twod = N/2; twod >= 1; twod /= 2)
     {
         int twod1 = twod*2;
-        printf("%d\n", __LINE__);
         scan_backward(twod1, N, device_result);
     }
-    printf("%d\n", __LINE__);
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -109,7 +96,6 @@ void exclusive_scan(int* device_start, int length, int* device_result)
  */
 double cudaScan(int* inarray, int* end, int* resultarray)
 {
-    printf("%d\n", __LINE__);
     int* device_result;
     int* device_input; 
     // We round the array sizes up to a power of 2, but elements after
@@ -132,7 +118,9 @@ double cudaScan(int* inarray, int* end, int* resultarray)
                cudaMemcpyHostToDevice);
 
     double startTime = CycleTimer::currentSeconds();
-
+    for (int i = 0; i < 10; i++) 
+        printf("%d ", inarray[i]);
+    printf("\n");
     exclusive_scan(device_input, end - inarray, device_result);
 
     // Wait for any work left over to be completed.
@@ -142,7 +130,10 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     
     cudaMemcpy(resultarray, device_result, (end - inarray) * sizeof(int),
                cudaMemcpyDeviceToHost);
-    return overallDuration;
+    for (int i = 0; i < 10; i++) 
+        printf("%d ", resultarray[i]);
+    printf("\n");
+   return overallDuration;
 }
 
 /* Wrapper around the Thrust library's exclusive scan function
