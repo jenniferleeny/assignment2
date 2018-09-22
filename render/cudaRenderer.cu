@@ -687,8 +687,8 @@ void
 CudaRenderer::render() {
     printf("%d\n", __LINE__);
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((image->width * image->height + blockDim.x - 1) / blockDim.x);
+    int blockDim = 256; //(256, 1);
+    int gridDim = (image->width * image->height + blockDim - 1) / blockDim;
 
     kernelRenderPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
