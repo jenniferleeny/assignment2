@@ -373,20 +373,34 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     // global memory write
     *imagePtr = newColor;
-    printf("%f %f %f\n", newColor.x, newColor.y, newColor.z);
     // END SHOULD-BE-ATOMIC REGION
 }
 
 __global__ void kernelRenderPixels() {
-    printf("%d\n", __LINE__);
     int ind = blockIdx.x * blockDim.x + threadIdx.x;
-    int imageWidth = cuParams.imageWidth;
-    int imageHeight = cuParams.imageHeight;
+    short imageWidth = cuParams.imageWidth;
+    short imageHeight = cuParams.imageHeight;
     int pixelX = ind % imageWidth;
     int pixelY = ind / imageWidth;
-    int invWidth = 1.f / cuParams.imageWidth;
-    int invHeight = 1.f / cuParams.imageHeight;
-    int num = cuParams.numCircles;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    /* for (int pixelX = 0; pixelX < imageWidth; pixelX++) {
+        for (int pixelY = 0; pixelY < imageHeight; pixelY++) {
+            for (int i = 0; i < cuParams.numCircles; i++) {
+                float3 p = *(float3*)(&cuParams.position[i*3]);
+        
+                float4* imagePtr = (float4*)(&cuParams.imageData[4 *
+                        (pixelY * cuParams.imageWidth + pixelX)]);
+                float2 pixelCenter = make_float2(invWidth * static_cast<float>(pixelX +
+                        0.5f), invHeight * static_cast<float>(pixelY + 0.5f));
+                shadePixel(i, pixelCenter, p, imagePtr);
+            }
+        }
+    } */
+
+
+    /* int num = cuParams.numCircles;
     int numOverlappingCircles = 0;
     for (int i = 0; i < num; i++) {
         float3 p = *(float3*)(&cuParams.position[i*3]);
@@ -411,22 +425,18 @@ __global__ void kernelRenderPixels() {
             circleOnPixel[index] = i;
             index++;
         }
-    }
-    for (int i = 0; i < numOverlappingCircles; i++) {
-        float3 p = *(float3*)(&cuParams.position[i*3]);
-        float rad = cuParams.radius[i];
-        short minX = static_cast<short>(imageWidth * (p.x - rad));
-        short minY = static_cast<short>(imageHeight * (p.y - rad));
-        short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-        short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    } */
 
-       float4* imagePtr = (float4*)(&cuParams.imageData[4 *
-                ((screenMinY + pixelY) * cuParams.imageWidth + screenMinX + pixelX)]);
+    for (int i = 0; i < cuParams.numCircles; i++) {
+        float3 p = *(float3*)(&cuParams.position[i*3]);
+
+        float4* imagePtr = (float4*)(&cuParams.imageData[4 *
+                (pixelY * cuParams.imageWidth + pixelX)]);
         float2 pixelCenter = make_float2(invWidth * static_cast<float>(pixelX +
                 0.5f), invHeight * static_cast<float>(pixelY + 0.5f));
-        shadePixel(circleOnPixel[i], pixelCenter, p, imagePtr);
+        shadePixel(i, pixelCenter, p, imagePtr);
     }
-    cudaFree(circleOnPixel);
+    // cudaFree(circleOnPixel);
 }
 
 // kernelRenderCircles -- (CUDA device code)
@@ -686,7 +696,7 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
     // 256 threads per block is a healthy number
-    dim3 blockDim(56, 56);
+    dim3 blockDim(256, 1);
     dim3 gridDim ((image->width * image->height + blockDim.x - 1) / blockDim.x);
 
     kernelRenderPixels<<<gridDim, blockDim>>>();
