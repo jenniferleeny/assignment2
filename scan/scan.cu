@@ -78,6 +78,7 @@ void exclusive_scan(int* device_start, int length, int* device_result)
         int twod1 = twod*2;
         scan_forward(twod1, N, device_result);
     }
+
     int zero = 0;
     // device_result[N-1] = 0;
     cudaMemcpy(device_result + N-1, &zero, sizeof(int), cudaMemcpyHostToDevice);
@@ -118,9 +119,6 @@ double cudaScan(int* inarray, int* end, int* resultarray)
                cudaMemcpyHostToDevice);
 
     double startTime = CycleTimer::currentSeconds();
-    for (int i = 0; i < 10; i++) 
-        printf("%d ", inarray[i]);
-    printf("\n");
     exclusive_scan(device_input, end - inarray, device_result);
 
     // Wait for any work left over to be completed.
@@ -130,9 +128,6 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     
     cudaMemcpy(resultarray, device_result, (end - inarray) * sizeof(int),
                cudaMemcpyDeviceToHost);
-    for (int i = 0; i < 10; i++) 
-        printf("%d ", resultarray[i]);
-    printf("\n");
    return overallDuration;
 }
 
@@ -166,6 +161,23 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration;
 }
 
+__global__ void check_repeat(int N, int* elements, int* result) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index + 1 < N && elements[index] == elements[index + 1]) {
+        result[index] = 1;
+    }
+    else {
+        result[index] = 0;
+    }
+}
+
+__global__ void place_element(int N, int* indices, int* result) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index + 1 < N && indices[index] != indices[index + 1]) {
+        result[indices[index]] = index;
+    }
+}
+
 int find_repeats(int *device_input, int length, int *device_output) {
     /* Finds all pairs of adjacent repeated elements in the list, storing the
      * indices of the first element of each pair (in order) into device_result.
@@ -178,7 +190,30 @@ int find_repeats(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_repeats are correct given the original length.
      */    
-    return 0;
+
+    int tasks = length;
+    const int threadsPerBlock = 512;
+    const int blocks = (tasks + threadsPerBlock - 1) / threadsPerBlock;
+    int N = nextPow2(length);
+
+    int* repeated_elements;
+    cudaMalloc((void **)&repeated_elements, sizeof(int) * N);
+
+    check_repeat<<<blocks, threadsPerBlock>>>(length, device_input, 
+                                              repeated_elements);
+    cudaThreadSynchronize();
+
+    exclusive_scan(repeated_elements, length, repeated_elements);
+
+    place_element<<<blocks, threadsPerBlock>>>(length, repeated_elements, 
+                                               device_output);
+    cudaThreadSynchronize();
+
+    int result_length;
+    cudaMemcpy(&result_length, repeated_elements + length - 1, sizeof(int), 
+                cudaMemcpyDeviceToHost);
+
+    return result_length;
 }
 
 /* Timing wrapper around find_repeats. You should not modify this function.
