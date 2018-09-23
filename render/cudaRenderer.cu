@@ -8,6 +8,9 @@
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 
+#include <thrust/scan.h>
+#include <thrust/execution_policy.h>
+
 #include "cudaRenderer.h"
 #include "image.h"
 #include "noise.h"
@@ -376,31 +379,40 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
-__global__ void kernelRenderPixels() {
+__global__ void kernelIntersections(int* intersections) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int circleIndex = index % cuParams.numCircles;
+    int pixelIndex = index / cuParams.numCircles;
+
+    short imageWidth = cuParams.imageWidth;
+    short imageHeight = cuParams.imageHeight;
+    int pixelCol = pixelIndex % imageWidth;
+    int pixelRow = pixelIndex / imageWidth;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float pixelX = invWidth * static_cast<float>(pixelCol + 0.5f);
+    float pixelY = invHeight * static_cast<float>(pixelRow + 0.5f);
+
+    float3 p = *(float3*)(&cuParams.position[circleIndex*3]);
+    float rad = cuParams.radius[circleIndex];
+    float dx = p.x - pixelX;
+    float dy = p.y - pixelY;
+    float distance = dx * dx + dy * dy;
+    intersections[index] = distance < rad * rad ? 1 : 0;
+}
+
+__global__ void kernelRenderPixels(int *intersections) {
     int ind = blockIdx.x * blockDim.x + threadIdx.x;
     short imageWidth = cuParams.imageWidth;
     short imageHeight = cuParams.imageHeight;
-    int pixelX = ind % imageWidth;
-    int pixelY = ind / imageWidth;
+    int pixelCol = ind % imageWidth;
+    int pixelRow = ind / imageWidth;
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
+    float pixelX = invWidth * static_cast<float>(pixelCol + 0.5f);
+    float pixelY = invHeight * static_cast<float>(pixelRow + 0.5f);
 
-    /* for (int pixelX = 0; pixelX < imageWidth; pixelX++) {
-        for (int pixelY = 0; pixelY < imageHeight; pixelY++) {
-            for (int i = 0; i < cuParams.numCircles; i++) {
-                float3 p = *(float3*)(&cuParams.position[i*3]);
-        
-                float4* imagePtr = (float4*)(&cuParams.imageData[4 *
-                        (pixelY * cuParams.imageWidth + pixelX)]);
-                float2 pixelCenter = make_float2(invWidth * static_cast<float>(pixelX +
-                        0.5f), invHeight * static_cast<float>(pixelY + 0.5f));
-                shadePixel(i, pixelCenter, p, imagePtr);
-            }
-        }
-    } */
-
-
-    /* int num = cuParams.numCircles;
+    int num = cuParams.numCircles;
     int numOverlappingCircles = 0;
     for (int i = 0; i < num; i++) {
         float3 p = *(float3*)(&cuParams.position[i*3]);
@@ -411,32 +423,33 @@ __global__ void kernelRenderPixels() {
         if (distance < rad*rad) 
             numOverlappingCircles++;
     }
-    int* circleOnPixel;
-    cudaMalloc(&circleOnPixel, sizeof(int) * numOverlappingCircles);
+    int *circles = (int*)malloc(sizeof(int) * numOverlappingCircles);
     int index = 0;
     for (int i = 0; i < num; i++) {
         float3 p = *(float3*)(&cuParams.position[i*3]);
-        float  rad = cuParams.radius[i];
+        float rad = cuParams.radius[i];
         float dx = p.x - pixelX;
         float dy = p.y - pixelY;
         float distance = dx * dx + dy * dy;
         
         if (distance < rad*rad) { 
-            circleOnPixel[index] = i;
+            circles[index] = i;
             index++;
         }
-    } */
-
-    for (int i = 0; i < cuParams.numCircles; i++) {
-        float3 p = *(float3*)(&cuParams.position[i*3]);
-
-        float4* imagePtr = (float4*)(&cuParams.imageData[4 *
-                (pixelY * cuParams.imageWidth + pixelX)]);
-        float2 pixelCenter = make_float2(invWidth * static_cast<float>(pixelX +
-                0.5f), invHeight * static_cast<float>(pixelY + 0.5f));
-        shadePixel(i, pixelCenter, p, imagePtr);
     }
-    // cudaFree(circleOnPixel);
+ 
+    float4* imagePtr = (float4*)(&cuParams.imageData[4 *
+                (pixelRow * cuParams.imageWidth + pixelCol)]);
+    float2 pixelCenter = make_float2(pixelX, pixelY);
+
+    for (int i = 0; i < numOverlappingCircles; i++) {
+        int circleIndex = circles[i];
+        float3 p = *(float3*)(&cuParams.position[circleIndex*3]);
+        
+        shadePixel(circleIndex, pixelCenter, p, imagePtr);
+    }
+    
+    free(circles);
 }
 
 // kernelRenderCircles -- (CUDA device code)
@@ -695,10 +708,23 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim ((image->width * image->height + blockDim.x - 1) / blockDim.x);
-
-    kernelRenderPixels<<<gridDim, blockDim>>>();
+    dim3 pixelCircleBlockDim(256, 1);
+    int tasks = image->width * image->height * numCircles;
+    dim3 pixelCircleGridDim((tasks + pixelCircleBlockDim.x - 1) / pixelCircleBlockDim.x);
+    int *intersections;
+    cudaMalloc((void**)&intersections, sizeof(int) * tasks);
+    kernelIntersections<<<pixelCircleGridDim, pixelCircleBlockDim>>>(intersections);
     cudaDeviceSynchronize();
+
+    thrust::exclusive_scan(thrust::host, intersections, intersections + tasks, intersections);
+    
+    // 256 threads per block is a healthy number
+    dim3 pixelBlockDim(256, 1);
+    dim3 pixelGridDim ((image->width * image->height + pixelBlockDim.x - 1) /
+            pixelBlockDim.x);
+
+    kernelRenderPixels<<<pixelGridDim, pixelBlockDim>>>(intersections);
+    cudaDeviceSynchronize();
+
+    cudaFree(intersections);
 }
