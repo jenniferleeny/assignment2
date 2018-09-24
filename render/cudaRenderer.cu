@@ -814,13 +814,6 @@ CudaRenderer::render() {
     dim3 pixelGridDim ((image->width * image->height + pixelBlockDim.x - 1) /
             pixelBlockDim.x);
   
-    /*int processSize = BLOCKSIZE - 1;
-    for (int offset = 0; offset < numCircles; offset += processSize) {
-        kernelInclusiveScan<<<blocks, BLOCKSIZE>>>(
-                                            intersections, offset);
-        cudaCheckError(cudaDeviceSynchronize());
-    } */
-
     kernelInclusiveScan<<<blocks, BLOCKSIZE>>>(intersections);
     cudaCheckError(cudaDeviceSynchronize());
 
