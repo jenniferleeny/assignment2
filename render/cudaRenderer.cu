@@ -8,14 +8,32 @@
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 
-#include <thrust/scan.h>
-#include <thrust/execution_policy.h>
-
 #include "cudaRenderer.h"
 #include "image.h"
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+
+#define BLOCKSIZE 32
+#define SCAN_BLOCK_DIM BLOCKSIZE
+
+#include "exclusiveScan.cu_inl"
+
+#define DEBUG
+#ifdef DEBUG
+#define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+    if (code != cudaSuccess)
+    {
+        fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+                cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -386,19 +404,24 @@ __global__ void kernelIntersections(int* intersections) {
 
     short imageWidth = cuParams.imageWidth;
     short imageHeight = cuParams.imageHeight;
-    int pixelCol = pixelIndex % imageWidth;
-    int pixelRow = pixelIndex / imageWidth;
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-    float pixelX = invWidth * static_cast<float>(pixelCol + 0.5f);
-    float pixelY = invHeight * static_cast<float>(pixelRow + 0.5f);
-
-    float3 p = *(float3*)(&cuParams.position[circleIndex*3]);
-    float rad = cuParams.radius[circleIndex];
-    float dx = p.x - pixelX;
-    float dy = p.y - pixelY;
-    float distance = dx * dx + dy * dy;
-    intersections[index] = distance < rad * rad ? 1 : 0;
+    if (pixelIndex >= imageWidth * imageHeight) {
+        intersections[index] = 0;
+    }
+    else {
+        int pixelCol = pixelIndex % imageWidth;
+        int pixelRow = pixelIndex / imageWidth;
+        float invWidth = 1.f / imageWidth;
+        float invHeight = 1.f / imageHeight;
+        float pixelX = invWidth * static_cast<float>(pixelCol + 0.5f);
+        float pixelY = invHeight * static_cast<float>(pixelRow + 0.5f);
+    
+        float3 p = *(float3*)(&cuParams.position[circleIndex*3]);
+        float rad = cuParams.radius[circleIndex];
+        float dx = p.x - pixelX;
+        float dy = p.y - pixelY;
+        float distance = dx * dx + dy * dy;
+        intersections[index] = distance < rad * rad ? 1 : 0;
+    }
 }
 
 __global__ void kernelEmptyFill(int *array) {
@@ -406,16 +429,48 @@ __global__ void kernelEmptyFill(int *array) {
     array[index] = -1;
 }
 
+__global__ void kernelInclusiveScan(int *intersections, int offset) {
+    int blockIndex = blockIdx.x;
+    int pixelIndexStart = cuParams.numCircles * blockIndex;
+    intersections += pixelIndexStart;
+
+    __shared__ uint prefixSumInput[BLOCKSIZE];
+    __shared__ uint prefixSumOutput[BLOCKSIZE];
+    __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
+
+    /* if (threadIdx.x == 0 && offset > 0) {
+        intersections[offset] += intersections[offset - 1];
+    }
+    if (threadIdx.x + offset < cuParams.numCircles) {
+        prefixSumInput[threadIdx.x] = threadIdx.x == BLOCKSIZE - 1 ? 0 : 
+                                  intersections[offset + threadIdx.x];
+    } else {
+        prefixSumInput[threadIdx.x] = 0;
+    }
+
+    __syncthreads();
+
+    sharedMemExclusiveScan(threadIdx.x, prefixSumInput, prefixSumOutput, 
+                           prefixSumScratch, BLOCKSIZE);
+    __syncthreads();
+
+    if (threadIdx.x + offset < cuParams.numCircles) {
+        intersections[threadIdx.x] = prefixSumOutput[threadIdx.x + 1];
+    } */
+}
+
 __global__ void kernelSetCircles(int* prefixSum, int* circles) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelIndex = index % cuParams.numCircles;
 
-    int previousNum = index > 0 ? prefixSum[index - 1] : 0;
-    int currentNum = prefixSum[index]; if (currentNum > previousNum) {
+    int previousNum = pixelIndex > 0 ? prefixSum[index - 1] : 0;
+    int currentNum = prefixSum[index]; 
+    if (currentNum > previousNum) {
         int circleIndex = index % cuParams.numCircles;
-        int pixelStartIndex = cuParams.numCircles * (index / cuParams.numCircles);
+        int pixelStartIndex = cuParams.numCircles * (index / 
+                                        cuParams.numCircles);
 
-        int baseSum = pixelStartIndex > 0 ? prefixSum[pixelStartIndex-1] : 0;
-        int pixelIndexOffset = currentNum - baseSum - 1;
+        int pixelIndexOffset = currentNum - 1;
         circles[pixelStartIndex + pixelIndexOffset] = circleIndex;
     }
 }
@@ -720,34 +775,54 @@ void printCudaMem(int *array, int length, int toPrint=-1, int start=0) {
 
 void
 CudaRenderer::render() {
+    printf("circles: %d", numCircles);
+
     dim3 pixelCircleBlockDim(256, 1);
-    int tasks = image->width * image->height * numCircles;
+    int tasks = image->width * image->height * numCircles + 1;
     dim3 pixelCircleGridDim((tasks + pixelCircleBlockDim.x - 1) /
                                             pixelCircleBlockDim.x);
-    int *intersections;
-    cudaMalloc((void**)&intersections, sizeof(int) * tasks);
-    kernelIntersections<<<pixelCircleGridDim, pixelCircleBlockDim>>>(intersections);
+
+    int* BOTH;
+    cudaCheckError(cudaMalloc((void**)&BOTH, 2 * sizeof(int) * tasks));
+
+
+    int* intersections = BOTH;
+    int* circles = BOTH + tasks;
+    /* int* intersections;
+    cudaCheckError(cudaMalloc((void**)&intersections, sizeof(int) * tasks));
+
+    int* circles;
+    cudaCheckError(cudaMalloc((void**)&circles, sizeof(int) * tasks)); */
+    kernelIntersections<<<pixelCircleGridDim, pixelCircleBlockDim>>>(
+                                                        intersections);
     cudaDeviceSynchronize();
 
-    thrust::inclusive_scan(thrust::device, intersections, 
-                           intersections + tasks, intersections);
-
-    int *circles;
-    cudaMalloc((void**)&circles, sizeof(int) * tasks);
-    kernelEmptyFill<<<pixelCircleGridDim, pixelCircleBlockDim>>>(circles);
-    cudaDeviceSynchronize();
-
-    kernelSetCircles<<<pixelCircleGridDim, pixelCircleBlockDim>>>(intersections,
-                                                                  circles);
-    cudaDeviceSynchronize();
-   
     // 256 threads per block is a healthy number
     dim3 pixelBlockDim(256, 1);
+    int pixels = image->width * image->height;
     dim3 pixelGridDim ((image->width * image->height + pixelBlockDim.x - 1) /
             pixelBlockDim.x);
+  
+    // int start = tasks / 2 + 700;
+    int start = 205 * image->width + 390;
+    start *= numCircles;
+    start = numCircles * (start / numCircles);
+    int processSize = BLOCKSIZE - 1;
+    for (int offset = 0; offset < numCircles; offset += processSize) {
+        kernelInclusiveScan<<<pixels, BLOCKSIZE>>>(
+                                            intersections, offset);
+        cudaCheckError(cudaDeviceSynchronize());
+    }
+
+    kernelEmptyFill<<<pixelCircleGridDim, pixelCircleBlockDim>>>(circles);
+    cudaCheckError(cudaDeviceSynchronize());
+
+    kernelSetCircles<<<pixelCircleGridDim, pixelCircleBlockDim>>>(
+            intersections, circles);
+    cudaCheckError(cudaDeviceSynchronize());
 
     kernelRenderPixels<<<pixelGridDim, pixelBlockDim>>>(circles);
-    cudaDeviceSynchronize();
+    cudaCheckError(cudaDeviceSynchronize());
 
     cudaFree(intersections);
     cudaFree(circles);
