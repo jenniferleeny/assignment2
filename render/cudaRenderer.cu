@@ -14,7 +14,7 @@
 #include "sceneLoader.h"
 #include "util.h"
 
-#define BLOCKS_PER_SIDE 64
+#define BLOCKS_PER_SIDE 8
 #define BLOCKSIZE 1024
 #define SCAN_BLOCK_DIM BLOCKSIZE
 
@@ -435,7 +435,7 @@ __global__ void kernelEmptyFill(int *array) {
     array[index] = -1;
 }
 
-__global__ void kernelInclusiveScan(int *intersections, int offset) {
+__global__ void kernelInclusiveScan(int *intersections) {
     int blockIndex = blockIdx.x;
     int blockIndexStart = cuParams.numCircles * blockIndex;
     intersections = intersections + blockIndexStart;
@@ -444,22 +444,28 @@ __global__ void kernelInclusiveScan(int *intersections, int offset) {
     __shared__ uint prefixSumOutput[BLOCKSIZE];
     __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
 
-    if (threadIdx.x == 0 && offset > 0) {
-        intersections[offset] += intersections[offset - 1];
-    }
-    if (threadIdx.x + offset < cuParams.numCircles) {
-        prefixSumInput[threadIdx.x] = (threadIdx.x == BLOCKSIZE - 1 ? 0 : 
-                                  intersections[offset + threadIdx.x]);
-    } else {
-        prefixSumInput[threadIdx.x] = 0;
-    }
+    int processSize = BLOCKSIZE - 1;
+    for (int offset = 0; offset < cuParams.numCircles; offset += processSize) {
 
-    sharedMemExclusiveScan(threadIdx.x, prefixSumInput, prefixSumOutput, 
-                           prefixSumScratch, BLOCKSIZE);
-    __syncthreads();
+        if (threadIdx.x == 0 && offset > 0) {
+            intersections[offset] += intersections[offset - 1];
+        }
+        if (threadIdx.x + offset < cuParams.numCircles) {
+            prefixSumInput[threadIdx.x] = (threadIdx.x == BLOCKSIZE - 1 ? 0 : 
+                                      intersections[offset + threadIdx.x]);
+        } else {
+            prefixSumInput[threadIdx.x] = 0;
+        }
+    
+        sharedMemExclusiveScan(threadIdx.x, prefixSumInput, prefixSumOutput, 
+                               prefixSumScratch, BLOCKSIZE);
+        __syncthreads();
+    
+        if (threadIdx.x + offset < cuParams.numCircles) {
+            intersections[offset + threadIdx.x] = prefixSumOutput[threadIdx.x + 1];
+        }
 
-    if (threadIdx.x + offset < cuParams.numCircles) {
-        intersections[offset + threadIdx.x] = prefixSumOutput[threadIdx.x + 1];
+        __syncthreads();
     }
 }
 
@@ -808,12 +814,16 @@ CudaRenderer::render() {
     dim3 pixelGridDim ((image->width * image->height + pixelBlockDim.x - 1) /
             pixelBlockDim.x);
   
-    int processSize = BLOCKSIZE - 1;
+    /*int processSize = BLOCKSIZE - 1;
     for (int offset = 0; offset < numCircles; offset += processSize) {
         kernelInclusiveScan<<<blocks, BLOCKSIZE>>>(
                                             intersections, offset);
         cudaCheckError(cudaDeviceSynchronize());
-    }
+    } */
+
+    kernelInclusiveScan<<<blocks, BLOCKSIZE>>>(intersections);
+    cudaCheckError(cudaDeviceSynchronize());
+
 
     kernelSetCircles<<<blockCircleGridDim, blockCircleBlockDim>>>(
             intersections, circles);
