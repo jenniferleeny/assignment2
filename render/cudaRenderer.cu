@@ -394,38 +394,9 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, float rad, float3 rgb
     // END SHOULD-BE-ATOMIC REGION
 }
 
-__global__ void kernelIntersections(int* intersections) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int circleIndex = index % cuParams.numCircles;
-    int blockIndex = index / cuParams.numCircles;
-
-    short imageWidth = cuParams.imageWidth;
-    short imageHeight = cuParams.imageHeight;
-    int blockCols = (imageWidth + BLOCK_LENGTH - 1) / BLOCK_LENGTH;
-    int blockRow = blockIndex / blockCols;
-    int blockCol = blockIndex % blockCols;
-
-    int pixelTopRow = blockRow * BLOCK_LENGTH;
-    int pixelBotRow = pixelTopRow + BLOCK_LENGTH;
-    int pixelLeftCol = blockCol * BLOCK_LENGTH;
-    int pixelRightCol = pixelLeftCol + BLOCK_LENGTH;
-
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-    float pixelTop = invHeight * static_cast<float>(pixelTopRow + 0.5f);
-    float pixelBot = invHeight * static_cast<float>(pixelBotRow + 0.5f);
-    float pixelLeft = invWidth * static_cast<float>(pixelLeftCol + 0.5f);
-    float pixelRight = invWidth * static_cast<float>(pixelRightCol + 0.5f);
-
-    float3 p = *(float3*)(&cuParams.position[circleIndex*3]);
-    float rad = cuParams.radius[circleIndex];
-    intersections[index] = circleInBoxConservative(p.x, p.y, rad, pixelLeft, 
-                                       pixelRight, pixelBot, pixelTop);
-}
-
 __global__ void kernelRender() {
+    int numCircles = cuParams.numCircles;
     int blockIndex = blockIdx.x;
-    int blockIndexStart = cuParams.numCircles * blockIndex;
 
     short imageWidth = cuParams.imageWidth;
     short imageHeight = cuParams.imageHeight;
@@ -471,34 +442,37 @@ __global__ void kernelRender() {
     __shared__ float3 sharedRgbs[threadsPerBlock];
 
     int processSize = BLOCKSIZE - 1;
-    for (int offset = 0; offset < cuParams.numCircles; offset += processSize) {
-        if (threadIdx.x + offset < cuParams.numCircles) {
-            if (threadIdx.x == BLOCKSIZE - 1) {
-                prefixSumInput[threadIdx.x] = 0;
-            }
-            else {
-                int circleIndex = offset + threadIdx.x;
-                float3 p = *(float3*)(&cuParams.position[circleIndex*3]);
-                float rad = cuParams.radius[circleIndex];
-                prefixSumInput[threadIdx.x] = circleInBoxConservative(p.x, p.y, rad, boxLeft, 
+    for (int offset = 0; offset < numCircles; offset += processSize) {
+        int circleIndex = offset + threadIdx.x;
+
+        if (threadIdx.x + offset < numCircles && threadIdx.x < BLOCKSIZE - 1) {
+            float3 p = *(float3*)(&cuParams.position[circleIndex*3]);
+            float rad = cuParams.radius[circleIndex];
+            
+            int isIn = circleInBoxConservative(p.x, p.y, rad, boxLeft, 
                                        boxRight, boxBot, boxTop);
+            prefixSumInput[threadIdx.x] = isIn;
+            if (isIn == 1) {
+                sharedPs[threadIdx.x] = p;
+                sharedRads[threadIdx.x] = rad; 
+                sharedRgbs[threadIdx.x] = *(float3*)&(cuParams.color[circleIndex*3]);
             }
 
         } else {
             prefixSumInput[threadIdx.x] = 0;
         }
-    
+
+        __syncthreads();
+
         sharedMemExclusiveScan(threadIdx.x, prefixSumInput, prefixSumOutput, 
                                prefixSumScratch, BLOCKSIZE);
+
         __syncthreads();
 
         int threadOutput = prefixSumOutput[threadIdx.x];
+
         if (threadIdx.x < BLOCKSIZE - 1 && threadOutput < prefixSumOutput[threadIdx.x + 1]) {
-            int circleIndex = offset + threadIdx.x;
-            sharedCircles[threadOutput] = circleIndex;
-            sharedPs[threadOutput] = *(float3*)(&cuParams.position[circleIndex*3]);
-            sharedRads[threadOutput] = cuParams.radius[circleIndex];
-            sharedRgbs[threadOutput] = *(float3*)&(cuParams.color[circleIndex*3]);
+            sharedCircles[threadOutput] = threadIdx.x;
         }
         else {
             sharedCircles[prefixSumOutput[BLOCKSIZE-1]] = -1;
@@ -507,10 +481,11 @@ __global__ void kernelRender() {
         __syncthreads();
 
         int i = 0;
-            while (i < BLOCKSIZE && sharedCircles[i] != -1) {
-            float3 p = sharedPs[i];
-            float rad = sharedRads[i];
-            float3 rgb = sharedRgbs[i];
+        while (i < BLOCKSIZE && sharedCircles[i] != -1) {
+            int index = sharedCircles[i];
+            float3 p = sharedPs[index];
+            float rad = sharedRads[index];
+            float3 rgb = sharedRgbs[index];
             
             shadePixel(pixelCenter, p, imagePtr, rad, rgb);
             i++;
@@ -755,5 +730,5 @@ CudaRenderer::render() {
             (image->height + pixelBlockDim.y - 1) / pixelBlockDim.y);
 
     kernelRender<<<blocks, BLOCKSIZE>>>();
-    cudaCheckError(cudaDeviceSynchronize());
+    cudaDeviceSynchronize();
 }
