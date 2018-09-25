@@ -335,35 +335,6 @@ __global__ void kernelAdvanceSnowflake() {
     *((float3*)velocityPtr) = velocity;
 }
 
-__global__ void kernelIntersections(int* intersections) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int circleIndex = index % cuParams.numCircles;
-    int blockIndex = index / cuParams.numCircles;
-
-    short imageWidth = cuParams.imageWidth;
-    short imageHeight = cuParams.imageHeight;
-    int blockCols = (imageWidth + BLOCK_LENGTH - 1) / BLOCK_LENGTH;
-    int blockRow = blockIndex / blockCols;
-    int blockCol = blockIndex % blockCols;
-
-    int pixelTopRow = blockRow * BLOCK_LENGTH;
-    int pixelBotRow = pixelTopRow + BLOCK_LENGTH;
-    int pixelLeftCol = blockCol * BLOCK_LENGTH;
-    int pixelRightCol = pixelLeftCol + BLOCK_LENGTH;
-
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-    float pixelTop = invHeight * static_cast<float>(pixelTopRow + 0.5f);
-    float pixelBot = invHeight * static_cast<float>(pixelBotRow + 0.5f);
-    float pixelLeft = invWidth * static_cast<float>(pixelLeftCol + 0.5f);
-    float pixelRight = invWidth * static_cast<float>(pixelRightCol + 0.5f);
-
-    float3 p = *(float3*)(&cuParams.position[circleIndex*3]);
-    float rad = cuParams.radius[circleIndex];
-    intersections[index] = circleInBoxConservative(p.x, p.y, rad, pixelLeft, 
-                                       pixelRight, pixelBot, pixelTop);
-}
-
 // shadePixel -- (CUDA device code)
 //
 // given a pixel and a circle, determines the contribution to the
@@ -423,10 +394,38 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, float rad, float3 rgb
     // END SHOULD-BE-ATOMIC REGION
 }
 
-__global__ void kernelRender(int *intersections) {
+__global__ void kernelIntersections(int* intersections) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int circleIndex = index % cuParams.numCircles;
+    int blockIndex = index / cuParams.numCircles;
+
+    short imageWidth = cuParams.imageWidth;
+    short imageHeight = cuParams.imageHeight;
+    int blockCols = (imageWidth + BLOCK_LENGTH - 1) / BLOCK_LENGTH;
+    int blockRow = blockIndex / blockCols;
+    int blockCol = blockIndex % blockCols;
+
+    int pixelTopRow = blockRow * BLOCK_LENGTH;
+    int pixelBotRow = pixelTopRow + BLOCK_LENGTH;
+    int pixelLeftCol = blockCol * BLOCK_LENGTH;
+    int pixelRightCol = pixelLeftCol + BLOCK_LENGTH;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float pixelTop = invHeight * static_cast<float>(pixelTopRow + 0.5f);
+    float pixelBot = invHeight * static_cast<float>(pixelBotRow + 0.5f);
+    float pixelLeft = invWidth * static_cast<float>(pixelLeftCol + 0.5f);
+    float pixelRight = invWidth * static_cast<float>(pixelRightCol + 0.5f);
+
+    float3 p = *(float3*)(&cuParams.position[circleIndex*3]);
+    float rad = cuParams.radius[circleIndex];
+    intersections[index] = circleInBoxConservative(p.x, p.y, rad, pixelLeft, 
+                                       pixelRight, pixelBot, pixelTop);
+}
+
+__global__ void kernelRender() {
     int blockIndex = blockIdx.x;
     int blockIndexStart = cuParams.numCircles * blockIndex;
-    intersections += blockIndexStart;
 
     short imageWidth = cuParams.imageWidth;
     short imageHeight = cuParams.imageHeight;
@@ -446,6 +445,16 @@ __global__ void kernelRender(int *intersections) {
     float pixelX = invWidth * static_cast<float>(pixelCol + 0.5f);
     float pixelY = invHeight * static_cast<float>(pixelRow + 0.5f);
 
+    int boxTopRow = blockRow * BLOCK_LENGTH;
+    int boxBotRow = boxTopRow + BLOCK_LENGTH;
+    int boxLeftCol = blockCol * BLOCK_LENGTH;
+    int boxRightCol = boxLeftCol + BLOCK_LENGTH;
+
+    float boxTop = invHeight * static_cast<float>(boxTopRow + 0.5f);
+    float boxBot = invHeight * static_cast<float>(boxBotRow + 0.5f);
+    float boxLeft = invWidth * static_cast<float>(boxLeftCol + 0.5f);
+    float boxRight = invWidth * static_cast<float>(boxRightCol + 0.5f);
+
     float4* imagePtr = (float4*)(&cuParams.imageData[4 *
                 (pixelRow * cuParams.imageWidth + pixelCol)]);
     float2 pixelCenter = make_float2(pixelX, pixelY);
@@ -464,8 +473,17 @@ __global__ void kernelRender(int *intersections) {
     int processSize = BLOCKSIZE - 1;
     for (int offset = 0; offset < cuParams.numCircles; offset += processSize) {
         if (threadIdx.x + offset < cuParams.numCircles) {
-            prefixSumInput[threadIdx.x] = (threadIdx.x == BLOCKSIZE - 1 ? 0 : 
-                                      intersections[offset + threadIdx.x]);
+            if (threadIdx.x == BLOCKSIZE - 1) {
+                prefixSumInput[threadIdx.x] = 0;
+            }
+            else {
+                int circleIndex = offset + threadIdx.x;
+                float3 p = *(float3*)(&cuParams.position[circleIndex*3]);
+                float rad = cuParams.radius[circleIndex];
+                prefixSumInput[threadIdx.x] = circleInBoxConservative(p.x, p.y, rad, boxLeft, 
+                                       boxRight, boxBot, boxTop);
+            }
+
         } else {
             prefixSumInput[threadIdx.x] = 0;
         }
@@ -726,23 +744,9 @@ void printCudaMem(int *array, int length, int toPrint=-1, int start=0) {
 
 void
 CudaRenderer::render() {
-
     int blockRows = (image->height + BLOCK_LENGTH - 1) / BLOCK_LENGTH;
     int blockCols = (image->width + BLOCK_LENGTH - 1) / BLOCK_LENGTH;
     const int blocks = blockRows * blockCols;
-
-    int blockCircleBlockDim = 256;
-    int tasks = blocks * numCircles;
-    int blockCircleGridDim = (tasks + blockCircleBlockDim - 1) / 
-                                        blockCircleBlockDim;
-
-    int* intersections;
-    cudaCheckError(cudaMalloc((void**)&intersections, 
-                              sizeof(int) * tasks));
-
-    kernelIntersections<<<blockCircleGridDim, blockCircleBlockDim>>>(
-                                                        intersections);
-    cudaDeviceSynchronize();
 
     // 256 threads per block is a healthy number
     dim3 pixelBlockDim(BLOCK_LENGTH, BLOCK_LENGTH);
@@ -750,8 +754,6 @@ CudaRenderer::render() {
             (image->width + pixelBlockDim.x - 1) / pixelBlockDim.x,
             (image->height + pixelBlockDim.y - 1) / pixelBlockDim.y);
 
-    kernelRender<<<blocks, BLOCKSIZE>>>(intersections);
+    kernelRender<<<blocks, BLOCKSIZE>>>();
     cudaCheckError(cudaDeviceSynchronize());
-
-    cudaFree(intersections);
 }
